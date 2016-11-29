@@ -1,4 +1,5 @@
 #! /bin/bash
+#set -x
 #
 # Copyright (c) 2012 Red Hat, Inc.
 #
@@ -43,8 +44,8 @@ function callGETService {
         certAtt="--cacert $CA_CERT_PATH"
     fi
 
-    echo "Calling URI (GET): " ${uri}
-    curl -X GET -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" "$certAtt" "${ENGINE_URL}${uri}" --output "${COMM_FILE}" 2> /dev/null > "${COMM_FILE}"
+    #echo "Calling URI (GET): " ${uri}
+    curl -X GET -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" $certAtt "${ENGINE_URL}${uri}" --output "${COMM_FILE}" 2> /dev/null > "${COMM_FILE}"
 }
 
 function callPOSTService {
@@ -56,8 +57,8 @@ function callPOSTService {
         certAtt="--cacert $CA_CERT_PATH"
     fi
 
-    echo "Calling URI (POST): " ${uri}
-    curl -X POST -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" "$certAtt" "${ENGINE_URL}${uri}" -d "${xml}" 2> /dev/null > "${COMM_FILE}"
+    #echo "Calling URI (POST): " ${uri}
+    curl -X POST -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" $certAtt "${ENGINE_URL}${uri}" -d "${xml}" 2> /dev/null > "${COMM_FILE}"
 }
 
 function callPUTService {
@@ -69,8 +70,8 @@ function callPUTService {
         certAtt="--cacert $CA_CERT_PATH"
     fi
 
-    echo "Calling URI (PUT): " ${uri}
-    curl -X PUT -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" "$certAtt" "${ENGINE_URL}${uri}" -d "${xml}" 2> /dev/null > "${COMM_FILE}"
+    #echo "Calling URI (PUT): " ${uri}
+    curl -X PUT -H "${HEADER_ACCEPT}" -H "${HEADER_CONTENT_TYPE}" -u "${USER_NAME}:${USER_PASSW}" $certAtt "${ENGINE_URL}${uri}" -d "${xml}" 2> /dev/null > "${COMM_FILE}"
 }
 
 # wait till XPath returns non-zero number of rows from specified REST API GET service
@@ -78,26 +79,50 @@ function waitForStatus {
     local uri=$1
     local xPathStatusTest=$2
     local xPathStatusValue=$3
-    local timeoutIntervalSec=$4
+    local retries=$4
+    local retryIntervalSec=$5
 
     local status="0"
-    for i in $(seq 1 10); do
+    while [ ${retries} -ne 0 ]; do
         callGETService "${uri}"
         local c=`getXPathCount "${xPathStatusTest}"`
         local val=`getXPathValue "${xPathStatusValue}"`
 
-        if [[ "$c" > "0" ]]; then
-            echo "Target status ${val} reached. Done."
+        if [ ${c} -gt 0 ]; then
+            #echo "Target status ${val} reached. Done."
             status="1"
             break;
         else
-            echo "Waiting for ${timeoutIntervalSec} s...(${i}, value=${val})"
-            sleep ${timeoutIntervalSec}
+	    retries=$((retries-1))
+            #echo "Waiting for ${retryIntervalSec} s...(${retries}, value=${val})"
+            sleep ${retryIntervalSec}
         fi
     done;
 
     if [[ "$status" == "0" ]]; then
-        echo "Timeout, waiting interrupted."
+        #echo "Timeout, waiting interrupted."
+	return 255
+    fi
+}
+
+# Function to check multiple disk status during migration
+function waitForDisk {
+    local uri=$1
+    local xPathStatusTest=$2
+    local xPathStatusValue=$3
+
+    local status="0"
+    callGETService "${uri}"
+    local c=`getXPathCount "${xPathStatusTest}"`
+    local val=`getXPathValue "${xPathStatusValue}"`
+
+    if [ ${c} -gt 0 ]; then
+    	#echo "Target status ${val} reached. Done."
+    	status="1"
+    	return 0 
+    else
+        #echo "Waiting for ${retryIntervalSec} s...(${retries}, value=${val})"
+    	return 1
     fi
 }
 
@@ -311,6 +336,12 @@ function getVirtualMachines {
     echo "Current VM count: " ${c}
 }
 
+# search VM
+function searchVirtualMachine {
+    local vmName=$1
+    callGETService "/api/vms/?search=$vmName"
+}
+
 # create VM
 function createVirtualMachineFromTemplate {
     local vmName=$1
@@ -391,6 +422,119 @@ function createVirtualMachineDisk {
           echo "Disk exists."
       fi
     fi
+}
+
+# Move VM Disk
+function moveVirtualMachineDisk {
+	local vmNames=$1
+
+	searchVirtualMachine "${vmNames}"
+	local vms=$(getXPathCount "/vms/vm/@id")
+	if [ ${vms} -eq 0 ]; then
+		echo "VM doesn't exist: ${vmNames}"
+	else
+		declare -a disks_in_move
+		for vm in $(xmllint --xpath "/vms/vm/@id" ${COMM_FILE} |sed -e "s/ /_/g;s/id\=\"//g;s/\"/ /g;s/_//g")
+		do
+        		callGETService "/api/vms/${vm}"
+			local vmName=$(getXPathValue "/vm/name")
+			local vmID=${vm}
+			local vmEnv=$(echo ${vmName} |awk -F"." '{print $2}')
+        		callGETService "/api/vms/${vmID}/disks"
+			local d=$(getXPathCount "/disks/disk")
+			for i in $(seq 1 $d)
+			do
+				if [ "$(getXPathValue "/disks/disk[${i}]/bootable")" == "true" ]; then
+					local osDisk=$(getXPathValue "/disks/disk[${i}]/name")
+					local osDiskID=$(getXPathValue "/disks/disk[${i}]/@id")
+					local osDiskStorageID=$(getXPathValue "/disks/disk[${i}]/storage_domains/storage_domain/@id")
+				else
+					local dataDisk[${i}]=$(getXPathValue "/disks/disk[${i}]/name")
+					local dataDiskID[${i}]=$(getXPathValue "/disks/disk[${i}]/@id")
+					local dataDiskSize[${i}]=$(getXPathValue "/disks/disk[${i}]/provisioned_size")
+					local dataDiskStorageID[${i}]=$(getXPathValue "/disks/disk[${i}]/storage_domains/storage_domain/@id")
+				fi
+			done
+			
+			callGETService "/api/storagedomains/?search=*-os-domain-${vmEnv}"
+			local osStorageID=$(getXPathValue "/storage_domains/storage_domain/@id")
+			local osStorage=$(getXPathValue "/storage_domains/storage_domain/name")
+			callGETService "/api/storagedomains/?search=*-data-domain-${vmEnv}"
+			local dataStorageID=$(getXPathValue "/storage_domains/storage_domain/@id")
+
+			# move osDisk
+			if [ -n "${osDisk}" -a -n "${osStorageID}" ]; then
+				if [ "${osStorageID}" != "${osDiskStorageID}" ]; then
+					echo "Moving ${osDisk} to ${osStorage}..."
+					local xml="<action><storage_domain id='${osStorageID}'/></action>"
+					callPOSTService "/api/disks/${osDiskID}/move" "${xml}"
+
+					if [ ${#disks_in_move[*]} -ne 0 ]; then
+						disks_in_move=("${disks_in_move[@]}" "${osDiskID}")
+					else
+						disks_in_move=("${osDiskID}")
+					fi
+
+					if [ ${#disks_in_move[*]} -eq 3 ]; then
+						local retries=100
+						local retryIntervalSec=6
+						# wait until disk is moved
+						echo "Waiting for a disk finish migration..."
+						while [ ${retries} -gt 0 ]; do
+							for i in $(seq 0 $((${#disks_in_move[*]}-1)))
+							do
+								waitForDisk "/api/disks/${disks_in_move[${i}]}" "/disk/status[state='ok']" "/disk/status/state"
+								if [ $? -eq 0 ]; then
+									local diskName=$(getXPathValue "/disk/name")
+									echo "Disk ${diskName} is done."
+									unset disks_in_move[${i}]
+									disks_in_move=("${disks_in_move[@]}")
+									break 2
+								elif [ $? -eq 1 ]; then
+									sleep 2
+								fi
+							done
+							retries=$((retries - 1))
+						done
+						if [ ${retries} -eq 0 ]; then
+							echo "ERROR: Timed out after 10 minutes"
+							break
+						fi
+					else
+						continue
+					fi
+				else
+					echo "${osDisk} is already on ${osStorage}"
+				fi
+			fi
+#			$(( provisioned_size / 1024 /1024 /1024))
+		done
+		while [ ${#disks_in_move[*]} -gt 0 ]; do
+			local retries=100
+			local retryIntervalSec=6
+			# wait until disk is moved
+			while [ ${retries} -gt 0 ]; do
+				for i in $(seq 0 $((${#disks_in_move[*]}-1)))
+				do
+					waitForDisk "/api/disks/${disks_in_move[${i}]}" "/disk/status[state='ok']" "/disk/status/state"
+					if [ $? -eq 0 ]; then
+						local diskName=$(getXPathValue "/disk/name")
+						echo "Disk ${diskName} is done."
+						unset disks_in_move[${i}]
+						disks_in_move=("${disks_in_move[@]}")
+						break
+					elif [ $? -eq 1 ]; then
+						sleep 2
+					fi
+				done
+				retries=$((retries - 1))
+			done
+			if [ ${retries} -eq 0 ]; then
+				echo "ERROR: Timed out after 10 minutes"
+				break
+			fi
+		done
+	fi
 }
 
 # create VM iso drive
